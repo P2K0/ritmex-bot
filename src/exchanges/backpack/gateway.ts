@@ -31,8 +31,9 @@ const WebSocketCtor: typeof globalThis.WebSocket =
     ? globalThis.WebSocket
     : ((NodeWebSocket as unknown) as typeof globalThis.WebSocket);
 
-edUtils.sha512 = sha512 as unknown as typeof edUtils.sha512;
-edHashes.sha512 = sha512;
+// Configure ed25519 to use our sha512 implementation
+(edUtils as any).sha512 = sha512;
+(edHashes as any).sha512 = sha512;
 
 const ORDER_STATUS_MAP: Record<string, string> = {
   NEW: "NEW",
@@ -253,7 +254,7 @@ export class BackpackGateway {
           const status = this.normalizeStatus(entry.status ?? (entry.info?.status as string));
           if (this.isTerminalStatus(status)) continue;
           const mapped = this.mapRestOrder(entry);
-          active.set(mapped.orderId, mapped);
+          active.set(String(mapped.orderId), mapped);
         }
         this.localOrders.clear();
         for (const [id, order] of active.entries()) {
@@ -361,7 +362,7 @@ export class BackpackGateway {
 
     const order = await this.exchange.createOrder(symbol, ccxtType, side, amount, price, extraParams);
     const mapped = this.mapRestOrder(order as CcxtOrder);
-    this.localOrders.set(mapped.orderId, mapped);
+    this.localOrders.set(String(mapped.orderId), mapped);
     this.emitOrders();
     return mapped;
   }
@@ -541,7 +542,7 @@ export class BackpackGateway {
   private mapRestOrder(order: CcxtOrder): AsterOrder {
     const info = (order.info ?? {}) as Record<string, unknown>;
     const side = (order.side ?? "buy").toUpperCase() as "BUY" | "SELL";
-    let type = this.normalizeOrderType(order.type ?? (info.o as string));
+    let type = this.normalizeOrderType(order.type ?? (info.o as string)) as OrderType;
     if (
       order.triggerPrice != null ||
       info.triggerPrice != null ||
@@ -585,7 +586,7 @@ export class BackpackGateway {
     const sideRaw = String(data.S ?? "").toUpperCase();
     const side: "BUY" | "SELL" = sideRaw === "BID" ? "BUY" : "SELL";
     const triggerPresent = data.P != null || data.B != null;
-    const type = triggerPresent ? "STOP_MARKET" : String(data.o ?? "LIMIT").toUpperCase();
+    const type = (triggerPresent ? "STOP_MARKET" : String(data.o ?? "LIMIT").toUpperCase()) as OrderType;
     const status = this.normalizeStatus(data.X as string);
     const price = this.pickString([data.p, data.P, "0"]);
     const quantity = this.pickString([data.q, data.Y]);
@@ -834,12 +835,12 @@ export class BackpackGateway {
     const status = mapped.status;
     const id = mapped.orderId;
     if (this.isTerminalStatus(status)) {
-      if (this.localOrders.delete(id)) {
+      if (this.localOrders.delete(String(id))) {
         this.emitOrders();
       }
       return;
     }
-    this.localOrders.set(id, mapped);
+    this.localOrders.set(String(id), mapped);
     this.emitOrders();
   }
 
