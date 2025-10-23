@@ -19,9 +19,6 @@ function applyCommonFields(params: CreateOrderParams, intent: BaseOrderIntent): 
   if (intent.reduceOnly !== undefined) {
     params.reduceOnly = toStringBoolean(intent.reduceOnly);
   }
-  if (intent.closePosition !== undefined) {
-    params.closePosition = toStringBoolean(intent.closePosition);
-  }
   return params;
 }
 
@@ -85,4 +82,3 @@ export async function createClosePositionOrder(intent: ClosePositionIntent): Pro
   );
   return intent.adapter.createOrder(params);
 }
-
