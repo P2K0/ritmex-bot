@@ -80,7 +80,7 @@ export class GridEngine {
   private readonly locks: OrderLockMap = {};
   private readonly timers: OrderTimerMap = {};
   private readonly pendings: OrderPendingMap = {};
-  private readonly priceDecimals: number;
+  private priceDecimals: number;
   private readonly now: () => number;
   private readonly configValid: boolean;
   private readonly gridLevels: number[];
@@ -134,6 +134,7 @@ export class GridEngine {
   };
 
   private readonly log: LogHandler;
+  private precisionSync: Promise<void> | null = null;
 
   private timer: ReturnType<typeof setInterval> | null = null;
   private processing = false;
@@ -155,6 +156,7 @@ export class GridEngine {
     this.configValid = this.validateConfig();
     this.gridLevels = this.computeGridLevels();
     this.buildLevelMeta();
+    this.syncPrecision();
     this.running = this.configValid;
     if (!this.configValid) {
       this.stopReason = "配置无效，已暂停网格";
@@ -198,6 +200,52 @@ export class GridEngine {
 
   getSnapshot(): GridEngineSnapshot {
     return this.buildSnapshot();
+  }
+
+  private syncPrecision(): void {
+    if (this.precisionSync) return;
+    const getPrecision = this.exchange.getPrecision?.bind(this.exchange);
+    if (!getPrecision) return;
+    this.precisionSync = getPrecision()
+      .then((precision) => {
+        if (!precision) return;
+        let updated = false;
+        if (Number.isFinite(precision.priceTick) && precision.priceTick > 0) {
+          if (Math.abs(precision.priceTick - this.config.priceTick) > 1e-12) {
+            this.config.priceTick = precision.priceTick;
+            this.priceDecimals = decimalsOf(precision.priceTick);
+            updated = true;
+          }
+        }
+        if (Number.isFinite(precision.qtyStep) && precision.qtyStep > 0) {
+          if (Math.abs(precision.qtyStep - this.config.qtyStep) > 1e-12) {
+            this.config.qtyStep = precision.qtyStep;
+            updated = true;
+          }
+        }
+        if (updated) {
+          this.log(
+            "info",
+            `已同步交易精度: priceTick=${precision.priceTick} qtyStep=${precision.qtyStep}`
+          );
+          this.rebuildGridAfterPrecisionUpdate();
+        }
+      })
+      .catch((error) => {
+        this.log("error", `同步精度失败: ${extractMessage(error)}`);
+        this.precisionSync = null;
+        setTimeout(() => this.syncPrecision(), 2000);
+      });
+  }
+
+  private rebuildGridAfterPrecisionUpdate(): void {
+    if (!this.configValid) return;
+    const reference = this.getReferencePrice();
+    const newLevels = this.computeGridLevels();
+    this.gridLevels.length = 0;
+    this.gridLevels.push(...newLevels);
+    this.buildLevelMeta(reference);
+    this.emitUpdate();
   }
 
   private validateConfig(): boolean {

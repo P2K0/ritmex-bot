@@ -64,6 +64,9 @@ export class OffsetMakerEngine {
   private readonly tradeLog: ReturnType<typeof createTradeLog>;
   private readonly events = new StrategyEventEmitter<MakerEvent, OffsetMakerEngineSnapshot>();
   private readonly sessionVolume = new SessionVolumeTracker();
+  private priceTick: number = 0.1;
+  private qtyStep: number = 0.001;
+  private precisionSync: Promise<void> | null = null;
 
   private timer: ReturnType<typeof setInterval> | null = null;
   private processing = false;
@@ -93,6 +96,9 @@ export class OffsetMakerEngine {
     this.rateLimit = new RateLimitController(this.config.refreshIntervalMs, (type, detail) =>
       this.tradeLog.push(type, detail)
     );
+    this.priceTick = Math.max(1e-9, this.config.priceTick);
+    this.qtyStep = Math.max(1e-9, this.qtyStep);
+    this.syncPrecision();
     // Debounce window defaults to 3x refresh interval, min 1s
     this.repriceDwellMs = Math.max(1000, this.config.refreshIntervalMs * 3);
     this.bootstrap();
@@ -275,7 +281,7 @@ export class OffsetMakerEngine {
       const finalAsk = latestAsk ?? topAsk!;
 
       // 直接使用orderbook价格，格式化为字符串避免精度问题
-      const priceDecimals = Math.max(0, Math.floor(Math.log10(1 / this.config.priceTick)));
+      const priceDecimals = this.getPriceDecimals();
       const closeBidPrice = formatPriceToString(finalBid, priceDecimals);
       const closeAskPrice = formatPriceToString(finalAsk, priceDecimals);
       const bidPrice = formatPriceToString(finalBid - this.config.bidOffset, priceDecimals);
@@ -326,7 +332,7 @@ export class OffsetMakerEngine {
     const absPosition = Math.abs(position.positionAmt);
     const side: "BUY" | "SELL" = position.positionAmt > 0 ? "SELL" : "BUY";
     const { topBid, topAsk } = getTopPrices(this.depthSnapshot);
-    const priceDecimals = Math.max(0, Math.floor(Math.log10(1 / this.config.priceTick)));
+    const priceDecimals = this.getPriceDecimals();
     const closeBidPrice = topBid != null ? formatPriceToString(topBid, priceDecimals) : null;
     const closeAskPrice = topAsk != null ? formatPriceToString(topAsk, priceDecimals) : null;
     try {
@@ -464,7 +470,7 @@ export class OffsetMakerEngine {
       const newPrice = Number(t.price);
       const oldPrice = Number(existing.price);
       if (!Number.isFinite(newPrice) || !Number.isFinite(oldPrice)) continue;
-      const ticksDiff = Math.abs(newPrice - oldPrice) / this.config.priceTick;
+      const ticksDiff = Math.abs(newPrice - oldPrice) / this.priceTick;
       const recentPlaced = this.lastEntryOrderBySide[t.side]?.ts ?? 0;
       const withinDwell = Date.now() - recentPlaced < this.repriceDwellMs;
       if (ticksDiff < this.minRepriceTicks || withinDwell) {
@@ -529,8 +535,8 @@ export class OffsetMakerEngine {
             maxPct: this.config.maxCloseSlippagePct,
           },
           {
-            priceTick: this.config.priceTick,
-            qtyStep: 0.001, // 默认数量步长
+            priceTick: this.priceTick,
+            qtyStep: this.qtyStep,
           }
         );
         // Record last placed entry order timing and price
@@ -618,6 +624,48 @@ export class OffsetMakerEngine {
         }
       );
     }
+  }
+
+  private syncPrecision(): void {
+    if (this.precisionSync) return;
+    const getPrecision = this.exchange.getPrecision?.bind(this.exchange);
+    if (!getPrecision) return;
+    this.precisionSync = getPrecision()
+      .then((precision) => {
+        if (!precision) return;
+        let updated = false;
+        if (Number.isFinite(precision.priceTick) && precision.priceTick > 0) {
+          if (Math.abs(precision.priceTick - this.priceTick) > 1e-12) {
+            this.priceTick = precision.priceTick;
+            this.config.priceTick = precision.priceTick;
+            updated = true;
+          }
+        }
+        if (Number.isFinite(precision.qtyStep) && precision.qtyStep > 0) {
+          if (Math.abs(precision.qtyStep - this.qtyStep) > 1e-12) {
+            this.qtyStep = precision.qtyStep;
+            updated = true;
+          }
+        }
+        if (updated) {
+          this.tradeLog.push(
+            "info",
+            `已同步交易精度: priceTick=${precision.priceTick} qtyStep=${precision.qtyStep}`
+          );
+        }
+      })
+      .catch((error) => {
+        this.tradeLog.push("error", `同步精度失败: ${String(error)}`);
+        this.precisionSync = null;
+        setTimeout(() => this.syncPrecision(), 2000);
+      });
+  }
+
+  private getPriceDecimals(): number {
+    const tick = Math.max(1e-9, this.priceTick);
+    const raw = Math.log10(1 / tick);
+    if (!Number.isFinite(raw)) return 0;
+    return Math.max(0, Math.floor(raw + 1e-9));
   }
 
   private emitUpdate(): void {

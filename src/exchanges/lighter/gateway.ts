@@ -116,6 +116,8 @@ interface Pollers {
 const KLINE_DEFAULT_COUNT = 120;
 const DEFAULT_TICKER_POLL_MS = 3000;
 const DEFAULT_KLINE_POLL_MS = 15000;
+const WS_HEARTBEAT_INTERVAL_MS = 5_000;
+const WS_STALE_TIMEOUT_MS = 20_000;
 
 const RESOLUTION_MS: Record<string, number> = {
   "1m": 60_000,
@@ -172,6 +174,8 @@ export class LighterGateway {
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private readonly wsUrl: string;
   private connectPromise: Promise<void> | null = null;
+  private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+  private lastMessageAt = 0;
 
   private accountDetails: LighterAccountDetails | null = null;
   private positions: LighterPosition[] = [];
@@ -438,25 +442,56 @@ export class LighterGateway {
     await new Promise<void>((resolve, reject) => {
       const ws = new WebSocket(this.wsUrl);
       this.ws = ws;
+      let settled = false;
       const cleanup = () => {
         ws.removeAllListeners();
+        this.stopHeartbeat();
+        if (this.ws === ws) {
+          this.ws = null;
+        }
+      };
+      const fail = (error: unknown) => {
+        if (settled) return;
+        settled = true;
+        reject(error instanceof Error ? error : new Error(String(error)));
       };
       ws.on("open", async () => {
         try {
+          this.lastMessageAt = Date.now();
+          this.startHeartbeat();
           await this.subscribeChannels();
+          settled = true;
           resolve();
         } catch (error) {
-          reject(error);
+          cleanup();
+          fail(error);
+          return;
         }
       });
-      ws.on("message", (data) => this.handleMessage(data));
+      ws.on("message", (data) => {
+        this.lastMessageAt = Date.now();
+        this.handleMessage(data);
+      });
+      ws.on("pong", () => {
+        this.lastMessageAt = Date.now();
+      });
       ws.on("close", (code, reason) => {
         cleanup();
+        const normalizedReason = typeof reason === "string" && reason.length ? reason : undefined;
+        if (!settled) {
+          fail(new Error(`WebSocket closed before ready (code=${code}${normalizedReason ? `, reason=${normalizedReason}` : ""})`));
+          return;
+        }
         this.scheduleReconnect();
       });
       ws.on("error", (error) => {
-        cleanup();
         this.logger("ws:error", error);
+        cleanup();
+        if (!settled) {
+          fail(error);
+          return;
+        }
+        this.scheduleReconnect();
       });
     });
   }
@@ -504,6 +539,38 @@ export class LighterGateway {
       this.reconnectTimer = null;
       this.openWebSocket().catch((error) => this.logger("reconnect", error));
     }, 2000);
+  }
+
+  private startHeartbeat(): void {
+    if (this.heartbeatTimer) return;
+    this.heartbeatTimer = setInterval(() => {
+      const ws = this.ws;
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      const now = Date.now();
+      if (now - this.lastMessageAt > WS_STALE_TIMEOUT_MS) {
+        try {
+          ws.terminate();
+        } catch (error) {
+          this.logger("ws:terminate", error);
+        } finally {
+          this.stopHeartbeat();
+          this.scheduleReconnect();
+        }
+        return;
+      }
+      try {
+        ws.ping();
+      } catch (error) {
+        this.logger("ws:ping", error);
+      }
+    }, WS_HEARTBEAT_INTERVAL_MS);
+  }
+
+  private stopHeartbeat(): void {
+    if (this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = null;
+    }
   }
 
   private handleMessage(data: WebSocket.RawData): void {
@@ -785,6 +852,28 @@ export class LighterGateway {
     this.tickerEvent.emit(ticker);
   }
 
+  async getPrecision(): Promise<{
+    priceTick: number;
+    qtyStep: number;
+    priceDecimals: number;
+    sizeDecimals: number;
+    marketId: number | null;
+  }> {
+    await this.loadMetadata();
+    if (this.priceDecimals == null || this.sizeDecimals == null) {
+      throw new Error("Lighter market metadata not initialized");
+    }
+    const priceTick = decimalsToStep(this.priceDecimals);
+    const qtyStep = decimalsToStep(this.sizeDecimals);
+    return {
+      priceTick,
+      qtyStep,
+      priceDecimals: this.priceDecimals,
+      sizeDecimals: this.sizeDecimals,
+      marketId: this.marketId ?? null,
+    };
+  }
+
   private mapCreateOrderParams(params: CreateOrderParams): Omit<CreateOrderSignParams, "nonce"> & {
     baseAmountScaledString: string;
     priceScaledString: string;
@@ -952,4 +1041,12 @@ function mapTimeInForce(timeInForce: string | undefined, type: OrderType): numbe
     default:
       return LIGHTER_TIME_IN_FORCE.GOOD_TILL_TIME;
   }
+}
+
+function decimalsToStep(decimals: number): number {
+  if (!Number.isFinite(decimals) || decimals <= 0) {
+    return 1;
+  }
+  const step = Number(`1e-${decimals}`);
+  return Number.isFinite(step) ? step : Math.pow(10, -decimals);
 }

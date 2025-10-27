@@ -27,6 +27,14 @@ export interface KlineListener {
   (klines: AsterKline[]): void;
 }
 
+export interface ExchangePrecision {
+  priceTick: number;
+  qtyStep: number;
+  priceDecimals?: number;
+  sizeDecimals?: number;
+  marketId?: number;
+}
+
 export interface ExchangeAdapter {
   readonly id: string;
   supportsTrailingStops(): boolean;
@@ -39,4 +47,5 @@ export interface ExchangeAdapter {
   cancelOrder(params: { symbol: string; orderId: number | string }): Promise<void>;
   cancelOrders(params: { symbol: string; orderIdList: Array<number | string> }): Promise<void>;
   cancelAllOrders(params: { symbol: string }): Promise<void>;
+  getPrecision?(): Promise<ExchangePrecision | null>;
 }
