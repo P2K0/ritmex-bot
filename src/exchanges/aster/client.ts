@@ -795,8 +795,11 @@ export class AsterRestClient {
     // Keep the behavior exchange-specific by stripping them here for Aster.
     const type = String(params.type).toUpperCase();
     const isStopOrTrailing = type === "STOP_MARKET" || type === "TRAILING_STOP_MARKET";
+    const supportsClosePosition = type === "STOP_MARKET" || type === "TAKE_PROFIT_MARKET";
     if (!isStopOrTrailing) {
       if (params.reduceOnly !== undefined) payload.reduceOnly = params.reduceOnly;
+    }
+    if (supportsClosePosition) {
       if (params.closePosition !== undefined) payload.closePosition = params.closePosition;
     }
 
